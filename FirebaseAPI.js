@@ -9,274 +9,229 @@ const FirebaseAPI = (function() {
     let db = null;
     let initialized = false;
 
-    const ROOM_EXPIRY_MS = 120000; // 2 minutes
+    const ROOM_EXPIRY_MS = 4 * 60 * 60 * 1000; // 4 hours
     const MAX_FAILED_ATTEMPTS = 5;
+    const SIGNAL_TTL_MS = 30000; // signals expire after 30s
 
     function init() {
         if (initialized) return;
         if (typeof firebase === 'undefined') {
-            console.error('Firebase SDK not loaded.');
-            return;
+            throw new Error('Firebase SDK not loaded.');
         }
-        
         if (!firebase.apps.length) {
             firebase.initializeApp(config);
         }
-        
         db = firebase.database();
         initialized = true;
     }
 
     function generateRoomCode() {
-        // 8-character alphanumeric, excluding ambiguous chars
+        // 8-char alphanumeric, no ambiguous chars (0,O,I,1,l)
         const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-        let result = '';
+        const result = new Array(8);
         const array = new Uint8Array(8);
         crypto.getRandomValues(array);
         for (let i = 0; i < 8; i++) {
-            result += chars[array[i] % chars.length];
+            result[i] = chars[array[i] % chars.length];
         }
-        return result;
+        return result.join('');
     }
 
-    function generateDecoyField() {
-        const length = 16 + Math.floor(Math.random() * 32);
-        const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-        let result = '';
-        const array = new Uint8Array(length);
-        crypto.getRandomValues(array);
-        for (let i = 0; i < length; i++) {
-            result += chars[array[i] % chars.length];
-        }
-        return result;
+    function sanitizeRoomCode(code) {
+        if (typeof code !== 'string') return null;
+        const cleaned = code.toUpperCase().replace(/[^A-Z0-9]/g, '');
+        return cleaned.length === 8 ? cleaned : null;
     }
 
-    function generateRandomPadding() {
-        const length = 32 + Math.floor(Math.random() * 64);
-        const array = new Uint8Array(length);
-        crypto.getRandomValues(array);
-        return Array.from(array);
+    function sanitizePeerId(peerId) {
+        if (typeof peerId !== 'string') return null;
+        return /^[A-Z0-9]{8}$/.test(peerId) ? peerId : null;
     }
 
-    async function createRoom(peerId, publicKey) {
+    async function createRoom(peerId, publicKey, displayName) {
         init();
-        
+        if (!sanitizePeerId(peerId)) throw new Error('Invalid peer ID');
+
         const roomId = generateRoomCode();
         const now = Date.now();
         const ref = db.ref('rooms/' + roomId);
-        
-        const roomData = {
+
+        await ref.set({
             createdAt: now,
             expiresAt: now + ROOM_EXPIRY_MS,
             failedAttempts: 0,
-            locked: false,
-            decoy1: generateDecoyField(),
-            decoy2: generateDecoyField(),
-            hash: generateDecoyField()
-        };
-        
-        // Set room meta data
-        await ref.set(roomData);
-        
-        // Add self as first peer
+            locked: false
+        });
+
         await ref.child('peers/' + peerId).set({
             publicKey: publicKey,
+            displayName: displayName,
             joinedAt: now
         });
-        
-        // Schedule expiry check
-        setTimeout(() => {
-            checkAndExpireRoom(roomId);
-        }, ROOM_EXPIRY_MS + 5000);
-        
+
+        // Set up server-side cleanup via onDisconnect
+        ref.child('peers/' + peerId).onDisconnect().remove();
+
+        // Schedule client-side expiry
+        setTimeout(() => checkAndExpireRoom(roomId), ROOM_EXPIRY_MS + 5000);
+
         return roomId;
     }
 
-    async function joinRoom(roomId, peerId, publicKey) {
+    async function joinRoom(roomId, peerId, publicKey, displayName) {
         init();
-        
-        const ref = db.ref('rooms/' + roomId);
+        const safeRoom = sanitizeRoomCode(roomId);
+        const safePeer = sanitizePeerId(peerId);
+        if (!safeRoom) throw new Error('Invalid room code format');
+        if (!safePeer) throw new Error('Invalid peer ID');
+
+        const ref = db.ref('rooms/' + safeRoom);
         const snapshot = await ref.once('value');
-        
-        if (!snapshot.exists()) {
-            return null;
-        }
-        
+
+        if (!snapshot.exists()) return null;
+
         const roomData = snapshot.val();
-        
-        // Check validity
-        if (roomData.locked) {
-            throw new Error('Room is locked');
-        }
-        
+
+        if (roomData.locked) throw new Error('Room is locked due to too many failed attempts');
         if (Date.now() > roomData.expiresAt) {
-            await burnRoom(roomId);
+            await burnRoom(safeRoom);
             return null;
         }
-        
-        // Use transaction to safely add peer
-        const peerRef = ref.child('peers/' + peerId);
-        await peerRef.set({
-            publicKey: publicKey,
+
+        await ref.child('peers/' + safePeer).set({
+            publicKey,
+            displayName,
             joinedAt: firebase.database.ServerValue.TIMESTAMP
         });
-        
-        // Return room data with existing peers for the client to initiate connections
-        // We need to fetch the updated peer list
+
+        ref.child('peers/' + safePeer).onDisconnect().remove();
+
         const peersSnapshot = await ref.child('peers').once('value');
         const peersData = peersSnapshot.val() || {};
-        
-        // Format peers for the client (excluding self)
-        const peersList = [];
-        Object.keys(peersData).forEach(id => {
-            if (id !== peerId) {
-                peersList.push({
-                    id: id,
-                    publicKey: peersData[id].publicKey
-                });
-            }
-        });
-        
-        return {
-            ...roomData,
-            peers: peersList
-        };
+
+        const peersList = Object.entries(peersData)
+            .filter(([id]) => id !== safePeer)
+            .map(([id, data]) => ({ id, publicKey: data.publicKey, displayName: data.displayName }));
+
+        return { ...roomData, peers: peersList };
     }
 
     async function leaveRoom(roomId, peerId) {
         if (!roomId || !peerId) return;
         init();
-        
+        const safeRoom = sanitizeRoomCode(roomId);
+        const safePeer = sanitizePeerId(peerId);
+        if (!safeRoom || !safePeer) return;
+
         try {
-            const peerRef = db.ref('rooms/' + roomId + '/peers/' + peerId);
-            await peerRef.remove();
-            
-            // Check if room is empty to burn it
-            const peersSnapshot = await db.ref('rooms/' + roomId + '/peers').once('value');
-            if (!peersSnapshot.exists() || !peersSnapshot.val() || Object.keys(peersSnapshot.val()).length === 0) {
-                await burnRoom(roomId);
+            await db.ref('rooms/' + safeRoom + '/peers/' + safePeer).remove();
+            const peersSnapshot = await db.ref('rooms/' + safeRoom + '/peers').once('value');
+            if (!peersSnapshot.exists() || Object.keys(peersSnapshot.val() || {}).length === 0) {
+                await burnRoom(safeRoom);
             }
         } catch (err) {
-            // Silently fail
+            // Best effort
         }
     }
 
     async function burnRoom(roomId) {
         init();
-        await db.ref('rooms/' + roomId).remove();
+        const safeRoom = sanitizeRoomCode(roomId);
+        if (!safeRoom) return;
+        await db.ref('rooms/' + safeRoom).remove();
     }
 
     async function checkAndExpireRoom(roomId) {
         init();
         try {
-            const ref = db.ref('rooms/' + roomId);
-            const snapshot = await ref.once('value');
-            
+            const safeRoom = sanitizeRoomCode(roomId);
+            if (!safeRoom) return;
+            const snapshot = await db.ref('rooms/' + safeRoom).once('value');
             if (snapshot.exists()) {
                 const data = snapshot.val();
-                if (Date.now() > data.expiresAt) {
-                    await burnRoom(roomId);
-                }
+                if (Date.now() > data.expiresAt) await burnRoom(safeRoom);
             }
-        } catch (e) {
-            // Ignore
-        }
+        } catch (e) { /* ignore */ }
     }
 
     async function incrementFailedAttempts(roomId) {
         if (!roomId) return;
         init();
-        
-        const ref = db.ref('rooms/' + roomId);
-        
-        // Transaction to safely increment
-        await ref.transaction((currentData) => {
-            if (currentData === null) {
-                return null;
-            }
-            
-            currentData.failedAttempts = (currentData.failedAttempts || 0) + 1;
-            
-            if (currentData.failedAttempts >= MAX_FAILED_ATTEMPTS) {
-                currentData.locked = true;
-            }
-            
-            return currentData;
+        const safeRoom = sanitizeRoomCode(roomId);
+        if (!safeRoom) return;
+
+        await db.ref('rooms/' + safeRoom).transaction((current) => {
+            if (!current) return null;
+            current.failedAttempts = (current.failedAttempts || 0) + 1;
+            if (current.failedAttempts >= MAX_FAILED_ATTEMPTS) current.locked = true;
+            return current;
         });
     }
 
     async function sendSignal(roomId, fromPeerId, toPeerId, encryptedBlob) {
         init();
-        
-        const signalData = {
+        const safeRoom = sanitizeRoomCode(roomId);
+        if (!safeRoom) throw new Error('Invalid room code');
+
+        const signalRef = db.ref('rooms/' + safeRoom + '/signals').push();
+        const expiresAt = Date.now() + SIGNAL_TTL_MS;
+
+        await signalRef.set({
             from: fromPeerId,
             to: toPeerId,
-            encryptedBlob: encryptedBlob,
+            encryptedBlob,
             timestamp: firebase.database.ServerValue.TIMESTAMP,
-            randomPadding: generateRandomPadding(),
-            decoy1: generateDecoyField()
-        };
-        
-        // Push to signals sub-collection
-        await db.ref('rooms/' + roomId + '/signals').push(signalData);
+            expiresAt
+        });
+
+        // Auto-remove after TTL
+        signalRef.onDisconnect().remove();
+        setTimeout(() => signalRef.remove().catch(() => {}), SIGNAL_TTL_MS);
     }
 
     function listenForSignals(roomId, peerId, callback) {
         init();
-        
-        const signalsRef = db.ref('rooms/' + roomId + '/signals');
-        
-        // Listen for child_added events
-        const listener = signalsRef.on('child_added', async (snapshot) => {
+        const safeRoom = sanitizeRoomCode(roomId);
+        if (!safeRoom) return () => {};
+
+        const signalsRef = db.ref('rooms/' + safeRoom + '/signals');
+        const listener = signalsRef.on('child_added', (snapshot) => {
             const data = snapshot.val();
-            
-            // Filter for messages intended for this peer
             if (data && data.to === peerId) {
+                // Discard expired signals
+                if (data.expiresAt && Date.now() > data.expiresAt) {
+                    snapshot.ref.remove().catch(() => {});
+                    return;
+                }
                 callback(data);
-                
-                // Remove signal after processing (cleanup)
                 snapshot.ref.remove().catch(() => {});
             }
         });
-        
-        // Return unsubscribe function
-        return () => {
-            signalsRef.off('child_added', listener);
-        };
+
+        return () => signalsRef.off('child_added', listener);
     }
 
     async function getPeerPublicKey(roomId, peerId) {
         init();
-        
-        const snapshot = await db.ref('rooms/' + roomId + '/peers/' + peerId + '/publicKey').once('value');
+        const safeRoom = sanitizeRoomCode(roomId);
+        const safePeer = sanitizePeerId(peerId);
+        if (!safeRoom || !safePeer) return null;
+
+        const snapshot = await db.ref('rooms/' + safeRoom + '/peers/' + safePeer + '/publicKey').once('value');
         return snapshot.exists() ? snapshot.val() : null;
     }
 
     async function getRoom(roomId) {
         init();
-        const snapshot = await db.ref('rooms/' + roomId).once('value');
+        const safeRoom = sanitizeRoomCode(roomId);
+        if (!safeRoom) return null;
+        const snapshot = await db.ref('rooms/' + safeRoom).once('value');
         return snapshot.exists() ? snapshot.val() : null;
     }
 
-    // Cleanup function for periodic maintenance (optional)
-    async function cleanupExpiredRooms() {
-        // In a real production app, this would be done via Cloud Functions
-        // For this client-only implementation, we do best-effort cleanup on interaction
-        init();
-        const now = Date.now();
-        // This is expensive on client, so we rely mostly on on-demand expiry checks
-    }
-
     return {
-        init,
-        createRoom,
-        joinRoom,
-        leaveRoom,
-        burnRoom,
-        incrementFailedAttempts,
-        sendSignal,
-        listenForSignals,
-        getPeerPublicKey,
-        getRoom
+        init, createRoom, joinRoom, leaveRoom, burnRoom,
+        incrementFailedAttempts, sendSignal, listenForSignals,
+        getPeerPublicKey, getRoom, sanitizeRoomCode, sanitizePeerId
     };
 })();
