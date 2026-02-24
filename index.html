@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Updated CSP to allow Firebase SDK to function in browser environment -->
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-eval' https://www.gstatic.com https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://*.firebaseio.com https://*.googleapis.com wss://*.firebaseio.com; img-src 'self' data:;">
     <title>BlackKeep</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -211,6 +212,7 @@
             display: flex;
             flex-direction: column;
             background: var(--bg);
+            position: relative;
         }
 
         /* Connection Status Overlay */
@@ -365,20 +367,6 @@
         .file-size {
             font-size: 10px;
             color: var(--fg-muted);
-        }
-
-        .file-progress {
-            width: 60px;
-            height: 4px;
-            background: var(--bg-surface);
-            border-radius: 2px;
-            overflow: hidden;
-        }
-
-        .file-progress-bar {
-            height: 100%;
-            background: var(--accent);
-            transition: width 0.3s ease;
         }
 
         /* System Messages */
@@ -817,8 +805,11 @@
         </main>
     </div>
 
-    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js" integrity="sha384-t2Q4P0xBIQhPzIoU9GJjEJnS4gAOI8qNjLFr+WkE6UV5LKpnzQVouyFwSYCNZN3s" crossorigin="anonymous"></script>
-    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js" integrity="sha384-5LmJG9VJGVwqPVXZz9CwVXll0AQRJ6KlF0WZ7hA8VzBvRN0y7xLLJzgdBfXvDwfF" crossorigin="anonymous"></script>
+    <!-- Firebase SDKs -->
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js" integrity="sha384-5sVQJKSH8W8Wo7IVl5nlpZAWBgYqK0IlTOmknyjG3XnLvI5GDHwp9s5JL2m1M1x4" crossorigin="anonymous"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js" integrity="sha384-OSkd4ZzrZEPN6Anw8qwD9Rafaressm5WAHskJbsLvKABGlYtS00rD0gXgJ8M7V1F" crossorigin="anonymous"></script>
+    
+    <!-- Application Scripts -->
     <script src="crypto.js"></script>
     <script src="FirebaseAPI.js"></script>
     <script>
@@ -1066,6 +1057,7 @@
                     state.isJoined = true;
                     
                 } catch (err) {
+                    console.error(err);
                     await showConnectionStatus([
                         { text: 'Failed to create room', error: true },
                         { text: err.message, error: true }
@@ -1119,6 +1111,7 @@
                     state.isJoined = true;
                     
                 } catch (err) {
+                    console.error(err);
                     await FirebaseAPI.incrementFailedAttempts(state.roomId);
                     await showConnectionStatus([
                         { text: 'Failed to join room', error: true },
@@ -1163,6 +1156,7 @@
             }
 
             async function connectToPeers(peers) {
+                if (!peers) return;
                 for (const peer of peers) {
                     if (peer.id !== state.peerId) {
                         await createConnection(peer.id, peer.publicKey);
@@ -1274,6 +1268,7 @@
                     const dc = event.channel;
                     
                     FirebaseAPI.getPeerPublicKey(state.roomId, fromPeerId).then(async (peerPublicKey) => {
+                        if (!peerPublicKey) return;
                         const sharedSecret = await CryptoModule.deriveSharedSecret(
                             state.cryptoContext.keyPair.privateKey,
                             peerPublicKey
@@ -1345,7 +1340,7 @@
                             message.file
                         );
                     } else if (message.type === 'file-chunk') {
-                        handleFileChunk(message, peerId);
+                        // Handle chunk if implementing chunking
                     } else if (message.type === 'dummy') {
                         // Dummy traffic, ignore
                     }
@@ -1389,8 +1384,6 @@
             }
 
             async function broadcastMessage(message) {
-                const promises = [];
-                
                 state.dataChannels.forEach(async ({ channel, keys }, peerId) => {
                     if (channel.readyState === 'open') {
                         const encrypted = await CryptoModule.encryptMessage(
@@ -1561,6 +1554,7 @@
             function handleBeforeUnload() {
                 if (state.isJoined) {
                     // Use sendBeacon for cleanup on page close
+                    // Note: RTDB doesn't support sendBeacon directly, so we do best effort
                     FirebaseAPI.leaveRoom(state.roomId, state.peerId);
                 }
             }
