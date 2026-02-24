@@ -42,44 +42,31 @@ const CryptoModule = (function() {
         return new Uint8Array(sharedBits);
     }
 
-    async function deriveSessionKeys(sharedSecret, localPeerId, remotePeerId) {
-        // Deterministically order peers so both sides derive matching encryption/decryption keys
-        const [senderId, receiverId] = localPeerId < remotePeerId
-            ? [localPeerId, remotePeerId]
-            : [remotePeerId, localPeerId];
-
-        const infoA = new TextEncoder().encode(`blackkeep-v1:${senderId}:${receiverId}:A`);
-        const infoB = new TextEncoder().encode(`blackkeep-v1:${senderId}:${receiverId}:B`);
-
-        const salt = new Uint8Array(SALT_LENGTH); // fixed salt for determinism; randomness is in X25519
-        crypto.getRandomValues(salt); // but we do pass a random salt — both peers need same salt
-        // NOTE: salt is exchanged via the offer/answer signaling so both sides have it
-
+    async function deriveSessionKeys(sharedSecret) {
+        const salt = crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
+        
         const baseKey = await crypto.subtle.importKey(
             'raw', sharedSecret, { name: 'HKDF' }, false, ['deriveKey', 'deriveBits']
         );
-
-        // Key A encrypts from peer A->B, Key B encrypts from B->A
-        const keyA = await crypto.subtle.deriveKey(
-            { name: 'HKDF', hash: 'SHA-256', salt, info: infoA },
-            baseKey, { name: 'AES-GCM', length: 256 }, false,
-            localPeerId < remotePeerId ? ['encrypt'] : ['decrypt']
+    
+        const encryptionKey = await crypto.subtle.deriveKey(
+            { name: 'HKDF', hash: 'SHA-256', salt, info: new TextEncoder().encode('enc-v1') },
+            baseKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt']
         );
-
-        const keyB = await crypto.subtle.deriveKey(
-            { name: 'HKDF', hash: 'SHA-256', salt, info: infoB },
-            baseKey, { name: 'AES-GCM', length: 256 }, false,
-            localPeerId < remotePeerId ? ['decrypt'] : ['encrypt']
+    
+        const decryptionKey = await crypto.subtle.deriveKey(
+            { name: 'HKDF', hash: 'SHA-256', salt, info: new TextEncoder().encode('enc-v1') },
+            baseKey, { name: 'AES-GCM', length: 256 }, false, ['decrypt']
         );
-
+    
         const ratchetBits = await crypto.subtle.deriveBits(
-            { name: 'HKDF', hash: 'SHA-256', salt, info: new TextEncoder().encode('ratchet-seed-v1') },
+            { name: 'HKDF', hash: 'SHA-256', salt, info: new TextEncoder().encode('ratchet-v1') },
             baseKey, 256
         );
-
+    
         return {
-            encryptionKey: localPeerId < remotePeerId ? keyA : keyB,
-            decryptionKey: localPeerId < remotePeerId ? keyB : keyA,
+            encryptionKey,
+            decryptionKey,
             ratchetSeed: new Uint8Array(ratchetBits),
             salt
         };
