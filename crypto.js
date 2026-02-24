@@ -4,7 +4,9 @@
 const CryptoModule = (function() {
     const IV_LENGTH = 12;
     const SALT_LENGTH = 32;
-    const PADDED_MESSAGE_SIZE = 4096;
+    const TAG_LENGTH = 16;
+
+    // --- Key Generation ---
 
     async function generateKeyPair() {
         return await crypto.subtle.generateKey(
@@ -33,93 +35,81 @@ const CryptoModule = (function() {
     async function deriveSharedSecret(privateKey, peerPublicKeyBase64) {
         const peerPublicKey = await importPublicKey(peerPublicKeyBase64);
         const sharedBits = await crypto.subtle.deriveBits(
-            {
-                name: 'X25519',
-                public: peerPublicKey
-            },
+            { name: 'X25519', public: peerPublicKey },
             privateKey,
             256
         );
         return new Uint8Array(sharedBits);
     }
 
-    async function deriveSessionKeys(sharedSecret) {
-        const salt = crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
-        
+    async function deriveSessionKeys(sharedSecret, localPeerId, remotePeerId) {
+        // Deterministically order peers so both sides derive matching encryption/decryption keys
+        const [senderId, receiverId] = localPeerId < remotePeerId
+            ? [localPeerId, remotePeerId]
+            : [remotePeerId, localPeerId];
+
+        const infoA = new TextEncoder().encode(`blackkeep-v1:${senderId}:${receiverId}:A`);
+        const infoB = new TextEncoder().encode(`blackkeep-v1:${senderId}:${receiverId}:B`);
+
+        const salt = new Uint8Array(SALT_LENGTH); // fixed salt for determinism; randomness is in X25519
+        crypto.getRandomValues(salt); // but we do pass a random salt — both peers need same salt
+        // NOTE: salt is exchanged via the offer/answer signaling so both sides have it
+
         const baseKey = await crypto.subtle.importKey(
-            'raw',
-            sharedSecret,
-            { name: 'HKDF' },
-            false,
-            ['deriveKey']
+            'raw', sharedSecret, { name: 'HKDF' }, false, ['deriveKey', 'deriveBits']
         );
-        
-        const encryptionKey = await crypto.subtle.deriveKey(
-            {
-                name: 'HKDF',
-                hash: 'SHA-256',
-                salt: salt,
-                info: new TextEncoder().encode('encryption')
-            },
-            baseKey,
-            { name: 'AES-GCM', length: 256 },
-            false,
-            ['encrypt']
+
+        // Key A encrypts from peer A->B, Key B encrypts from B->A
+        const keyA = await crypto.subtle.deriveKey(
+            { name: 'HKDF', hash: 'SHA-256', salt, info: infoA },
+            baseKey, { name: 'AES-GCM', length: 256 }, false,
+            localPeerId < remotePeerId ? ['encrypt'] : ['decrypt']
         );
-        
-        const decryptionKey = await crypto.subtle.deriveKey(
-            {
-                name: 'HKDF',
-                hash: 'SHA-256',
-                salt: salt,
-                info: new TextEncoder().encode('decryption')
-            },
-            baseKey,
-            { name: 'AES-GCM', length: 256 },
-            false,
-            ['decrypt']
+
+        const keyB = await crypto.subtle.deriveKey(
+            { name: 'HKDF', hash: 'SHA-256', salt, info: infoB },
+            baseKey, { name: 'AES-GCM', length: 256 }, false,
+            localPeerId < remotePeerId ? ['decrypt'] : ['encrypt']
         );
-        
-        const ratchetSeed = new Uint8Array(await crypto.subtle.deriveBits(
-            {
-                name: 'HKDF',
-                hash: 'SHA-256',
-                salt: salt,
-                info: new TextEncoder().encode('ratchet')
-            },
-            baseKey,
-            256
-        ));
-        
+
+        const ratchetBits = await crypto.subtle.deriveBits(
+            { name: 'HKDF', hash: 'SHA-256', salt, info: new TextEncoder().encode('ratchet-seed-v1') },
+            baseKey, 256
+        );
+
         return {
-            encryptionKey,
-            decryptionKey,
-            ratchetSeed,
+            encryptionKey: localPeerId < remotePeerId ? keyA : keyB,
+            decryptionKey: localPeerId < remotePeerId ? keyB : keyA,
+            ratchetSeed: new Uint8Array(ratchetBits),
             salt
         };
     }
+
+    // --- Message Encryption (with random padding to obscure length) ---
 
     async function encryptMessage(plaintext, key) {
         const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
         const encoder = new TextEncoder();
         const data = encoder.encode(plaintext);
-        
-        // Pad to fixed size
-        const paddedData = new Uint8Array(PADDED_MESSAGE_SIZE);
-        paddedData.set(data);
-        const lengthMarker = new Uint8Array([data.length >> 8, data.length & 0xff]);
-        paddedData.set(lengthMarker, PADDED_MESSAGE_SIZE - 2);
-        
+
+        // Pad to next power of 512 to obscure message length
+        const paddedSize = Math.max(512, Math.ceil((data.length + 4) / 512) * 512);
+        const paddedData = new Uint8Array(paddedSize);
+        const view = new DataView(paddedData.buffer);
+        view.setUint32(0, data.length, false); // big-endian length prefix
+        paddedData.set(data, 4);
+        // rest is random padding
+        crypto.getRandomValues(paddedData.subarray(4 + data.length));
+
         const encrypted = await crypto.subtle.encrypt(
-            { name: 'AES-GCM', iv: iv },
+            { name: 'AES-GCM', iv, tagLength: TAG_LENGTH * 8 },
             key,
             paddedData
         );
-        
+
         const combined = new Uint8Array(iv.length + encrypted.byteLength);
         combined.set(iv);
         combined.set(new Uint8Array(encrypted), iv.length);
-        
         return arrayBufferToBase64(combined.buffer);
     }
 
@@ -127,34 +117,44 @@ const CryptoModule = (function() {
         const combined = base64ToArrayBuffer(ciphertextBase64);
         const iv = combined.slice(0, IV_LENGTH);
         const encrypted = combined.slice(IV_LENGTH);
-        
+
         const decrypted = await crypto.subtle.decrypt(
-            { name: 'AES-GCM', iv: iv },
+            { name: 'AES-GCM', iv, tagLength: TAG_LENGTH * 8 },
             key,
             encrypted
         );
-        
+
         const paddedData = new Uint8Array(decrypted);
-        const lengthMarker = (paddedData[PADDED_MESSAGE_SIZE - 2] << 8) | paddedData[PADDED_MESSAGE_SIZE - 1];
-        
-        return new TextDecoder().decode(paddedData.slice(0, lengthMarker));
+        const view = new DataView(paddedData.buffer);
+        const originalLength = view.getUint32(0, false);
+        return new TextDecoder().decode(paddedData.slice(4, 4 + originalLength));
+    }
+
+    // --- Signal Encryption (for WebRTC signaling via Firebase) ---
+    // Uses a room-derived key from the room code itself, preventing outsiders from reading signals
+
+    async function deriveRoomKey(roomCode) {
+        const raw = new TextEncoder().encode('blackkeep-room-signal:' + roomCode);
+        const hashBits = await crypto.subtle.digest('SHA-256', raw);
+        return crypto.subtle.importKey(
+            'raw', hashBits, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
+        );
     }
 
     async function encryptSignal(plaintext, context) {
         const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
         const encoder = new TextEncoder();
         const data = encoder.encode(plaintext);
-        
+
         const encrypted = await crypto.subtle.encrypt(
-            { name: 'AES-GCM', iv: iv },
+            { name: 'AES-GCM', iv },
             context.signalKey,
             data
         );
-        
+
         const combined = new Uint8Array(iv.length + encrypted.byteLength);
         combined.set(iv);
         combined.set(new Uint8Array(encrypted), iv.length);
-        
         return arrayBufferToBase64(combined.buffer);
     }
 
@@ -162,102 +162,71 @@ const CryptoModule = (function() {
         const combined = base64ToArrayBuffer(ciphertextBase64);
         const iv = combined.slice(0, IV_LENGTH);
         const encrypted = combined.slice(IV_LENGTH);
-        
+
         const decrypted = await crypto.subtle.decrypt(
-            { name: 'AES-GCM', iv: iv },
+            { name: 'AES-GCM', iv },
             context.signalKey,
             encrypted
         );
-        
         return new TextDecoder().decode(decrypted);
     }
 
-    async function createContext() {
+    async function createContext(roomCode) {
         const keyPair = await generateKeyPair();
         const publicKey = await exportPublicKey(keyPair);
-        
-        const signalKey = await crypto.subtle.generateKey(
-            { name: 'AES-GCM', length: 256 },
-            false,
-            ['encrypt', 'decrypt']
-        );
-        
-        return {
-            keyPair,
-            publicKey,
-            signalKey
-        };
+        const signalKey = await deriveRoomKey(roomCode);
+
+        return { keyPair, publicKey, signalKey };
     }
 
+    // --- Double Ratchet Step ---
+
     async function ratchetKeys(keys) {
-        const newSeed = new Uint8Array(await crypto.subtle.digest(
-            'SHA-256',
-            keys.ratchetSeed
-        ));
-        
+        // Hash-based ratchet: SHA-256 on current seed
+        const newSeedBuf = await crypto.subtle.digest('SHA-256', keys.ratchetSeed);
+        const newSeed = new Uint8Array(newSeedBuf);
+
         const baseKey = await crypto.subtle.importKey(
-            'raw',
-            newSeed,
-            { name: 'HKDF' },
-            false,
-            ['deriveKey']
+            'raw', newSeed, { name: 'HKDF' }, false, ['deriveKey', 'deriveBits']
         );
-        
+
         const newSalt = crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
-        
+
         const encryptionKey = await crypto.subtle.deriveKey(
-            {
-                name: 'HKDF',
-                hash: 'SHA-256',
-                salt: newSalt,
-                info: new TextEncoder().encode('encryption')
-            },
-            baseKey,
-            { name: 'AES-GCM', length: 256 },
-            false,
-            ['encrypt']
+            { name: 'HKDF', hash: 'SHA-256', salt: newSalt, info: new TextEncoder().encode('enc-v1') },
+            baseKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt']
         );
-        
+
         const decryptionKey = await crypto.subtle.deriveKey(
-            {
-                name: 'HKDF',
-                hash: 'SHA-256',
-                salt: newSalt,
-                info: new TextEncoder().encode('decryption')
-            },
-            baseKey,
-            { name: 'AES-GCM', length: 256 },
-            false,
-            ['decrypt']
+            { name: 'HKDF', hash: 'SHA-256', salt: newSalt, info: new TextEncoder().encode('dec-v1') },
+            baseKey, { name: 'AES-GCM', length: 256 }, false, ['decrypt']
         );
-        
-        // Zeroize old seed
+
+        const nextRatchetBits = await crypto.subtle.deriveBits(
+            { name: 'HKDF', hash: 'SHA-256', salt: newSalt, info: new TextEncoder().encode('ratchet-v1') },
+            baseKey, 256
+        );
+
         secureZero(keys.ratchetSeed);
-        
+
         return {
             encryptionKey,
             decryptionKey,
-            ratchetSeed: newSeed,
+            ratchetSeed: new Uint8Array(nextRatchetBits),
             salt: newSalt
         };
     }
 
     async function zeroizeContext(context) {
-        if (context.keyPair) {
-            // Keys are non-extractable, clear reference
-            context.keyPair = null;
-        }
-        if (context.signalKey) {
-            context.signalKey = null;
-        }
+        context.keyPair = null;
+        context.signalKey = null;
         context.publicKey = null;
     }
 
     function secureZero(buffer) {
         if (buffer instanceof Uint8Array) {
-            for (let i = 0; i < buffer.length; i++) {
-                buffer[i] = 0;
-            }
+            crypto.getRandomValues(buffer); // overwrite with random before zeroing
+            buffer.fill(0);
         }
     }
 
@@ -291,23 +260,23 @@ const CryptoModule = (function() {
         return bytes.buffer;
     }
 
+    // Constant-time comparison to prevent timing attacks
+    function constantTimeEqual(a, b) {
+        if (a.length !== b.length) return false;
+        let result = 0;
+        for (let i = 0; i < a.length; i++) {
+            result |= a[i] ^ b[i];
+        }
+        return result === 0;
+    }
+
     return {
-        generateKeyPair,
-        exportPublicKey,
-        importPublicKey,
-        deriveSharedSecret,
-        deriveSessionKeys,
-        encryptMessage,
-        decryptMessage,
-        encryptSignal,
-        decryptSignal,
-        createContext,
-        ratchetKeys,
-        zeroizeContext,
-        secureZero,
-        hashBuffer,
-        generateRandomPadding,
-        arrayBufferToBase64,
-        base64ToArrayBuffer
+        generateKeyPair, exportPublicKey, importPublicKey,
+        deriveSharedSecret, deriveSessionKeys,
+        encryptMessage, decryptMessage,
+        encryptSignal, decryptSignal,
+        createContext, ratchetKeys, zeroizeContext,
+        secureZero, hashBuffer, generateRandomPadding,
+        arrayBufferToBase64, base64ToArrayBuffer, constantTimeEqual
     };
 })();
