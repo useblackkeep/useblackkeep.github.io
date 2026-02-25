@@ -19,7 +19,6 @@ const App = (function() {
     // Listeners to unsubscribe
     let listeners = [];
     let typingTimeout = null;
-    let presenceListenerOff = null;
     let typingListeners = {};
     let messageListeners = {};
     let disappearTimers = {};
