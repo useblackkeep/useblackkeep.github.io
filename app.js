@@ -7,6 +7,7 @@ const App = (function() {
     let mySettings = {};
     let activeChatId = null;
     let activeChatData = null;
+    let presenceListenerOff = null;
     let friends = {}; // uid -> profile
     let chatList = {}; // chatId -> meta
     let replyingTo = null; // { msgId, content, sender }
@@ -18,6 +19,7 @@ const App = (function() {
     // Listeners to unsubscribe
     let listeners = [];
     let typingTimeout = null;
+    let presenceListenerOff = null;
     let typingListeners = {};
     let messageListeners = {};
     let disappearTimers = {};
@@ -184,10 +186,9 @@ const App = (function() {
         // Image viewer
         document.getElementById('imgViewerClose').addEventListener('click', closeImgViewer);
         document.getElementById('imgViewer').addEventListener('click', e => { if (e.target === document.getElementById('imgViewer')) closeImgViewer(); });
-
-        // Games
-        buildGameGrid();
     }
+
+    
 
     // ===================== SIDEBAR =====================
     async function loadSidebar() {
@@ -335,65 +336,58 @@ const App = (function() {
     async function openChat(chatId, meta) {
         activeChatId = chatId;
         activeChatData = meta;
-
-        // Update UI
+    
+        // Update sidebar active state
         document.querySelectorAll('.chat-list-item').forEach(el => {
             el.classList.toggle('active', el.dataset.chatId === chatId);
         });
-
+    
         document.getElementById('emptyChat').style.display = 'none';
         const chatView = document.getElementById('chatView');
         chatView.style.display = 'flex';
-
-        // Header
+    
+        // Header avatar
         const av = document.getElementById('chatAvatar');
         av.textContent = meta.avatarLetter || '?';
-        if (meta.isGroup) { av.style.background = 'rgba(124,58,237,0.12)'; av.style.color = '#7c3aed'; av.style.borderColor = 'rgba(124,58,237,0.2)'; }
-        else { av.style.background = ''; av.style.color = ''; av.style.borderColor = ''; }
+        if (meta.isGroup) {
+            av.style.background = 'rgba(124,58,237,0.12)';
+            av.style.color = '#7c3aed';
+            av.style.borderColor = 'rgba(124,58,237,0.2)';
+        } else {
+            av.style.background = '';
+            av.style.color = '';
+            av.style.borderColor = '';
+        }
         document.getElementById('chatName').textContent = meta.name;
-
-        // Status
+    
+        // Status + presence listener
+        if (presenceListenerOff) { presenceListenerOff(); presenceListenerOff = null; }
+    
         if (!meta.isGroup && meta.otherUid) {
             const presence = await DB.get('presence/' + meta.otherUid);
             updateChatStatus(presence);
-            // Listen to presence changes
-            const off = DB.onValue('presence/' + meta.otherUid, snap => {
+            presenceListenerOff = DB.onValue('presence/' + meta.otherUid, snap => {
                 updateChatStatus(snap.val());
             });
-            listeners.push(off);
         } else if (meta.isGroup) {
-            const memberUids = Object.keys((await DB.get('chats/' + chatId + '/members')) || {});
-            document.getElementById('chatStatus').textContent = memberUids.length + ' members';
+            const members = await DB.get('chats/' + chatId + '/members');
+            const count = Object.keys(members || {}).length;
+            document.getElementById('chatStatus').textContent = count + ' members';
         }
-
+    
         // Pin/mute button states
         const pinned = myProfile.pinnedChats && myProfile.pinnedChats[chatId];
         document.getElementById('chatPinBtn').classList.toggle('active', !!pinned);
         const muted = myProfile.mutedChats && myProfile.mutedChats[chatId];
         document.getElementById('chatMuteBtn').classList.toggle('active', !!muted);
-
-        // Load messages
+    
+        // Messages + typing
         loadMessages(chatId);
         listenTyping(chatId, meta);
-
-        // Mark all as read
         markAllRead(chatId);
-
-        // Focus input
+    
         document.getElementById('msgInput').focus();
     }
-
-    function updateChatStatus(presence) {
-        const statusEl = document.getElementById('chatStatus');
-        if (!presence) { statusEl.textContent = 'Last seen: unknown'; return; }
-        if (presence.status === 'online') {
-            statusEl.innerHTML = '<span style="color:var(--success)">● online</span>';
-        } else {
-            const last = presence.lastSeen ? 'Last seen ' + timeAgo(presence.lastSeen) : 'Offline';
-            statusEl.textContent = last;
-        }
-    }
-
     async function startOrOpenDM(uid) {
         // Find existing DM chat
         const chatsSnap = await DB.get('chats');
@@ -1231,7 +1225,7 @@ const App = (function() {
                     await DB.update('users/' + session.uid, { settings: JSON.stringify(mySettings) });
                 });
             });
-            content.getElementById?.('defaultDisappear')?.addEventListener('change', async e => {
+            document.getElementById('defaultDisappear')?.addEventListener('change', async e => {
                 mySettings.disappearingDefault = parseInt(e.target.value);
                 await DB.update('users/' + session.uid, { settings: JSON.stringify(mySettings) });
             });
@@ -1397,6 +1391,7 @@ const App = (function() {
         startReply,
         startEditMsg,
         deleteMsg,
+        _chatListOff: null,
     };
 })();
 
