@@ -132,7 +132,6 @@ const App = (function() {
         // Chat controls
         document.getElementById('chatImageBtn').addEventListener('click', () => openModal('imageEmbedModal'));
         document.getElementById('chatGifBtn').addEventListener('click', toggleGifPicker);
-        document.getElementById('chatGameBtn').addEventListener('click', openGameModal);
         document.getElementById('chatDisappearBtn').addEventListener('click', () => { if (activeChatId) openModal('disappearModal'); });
         document.getElementById('chatMuteBtn').addEventListener('click', toggleMuteChat);
         document.getElementById('chatPinBtn').addEventListener('click', togglePinChat);
@@ -204,44 +203,19 @@ const App = (function() {
 
     async function loadChats() {
         const chatListEl = document.getElementById('chatList');
-        // Listen for chats that include our UID
-        const chatsSnap = await DB.get('chats');
-        if (!chatsSnap) {
-            chatListEl.innerHTML = '<div class="empty-list"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>No chats yet</span></div>';
-            return;
-        }
-
-        // Filter to chats we're in
-        const myChats = Object.entries(chatsSnap).filter(([id, chat]) =>
-            chat.members && chat.members[session.uid]
-        );
-
-        if (myChats.length === 0) {
-            chatListEl.innerHTML = '<div class="empty-list"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>No chats yet</span></div>';
-            return;
-        }
-
-        // Sort: pinned first, then by last message time
-        myChats.sort((a, b) => {
-            const aPinned = myProfile.pinnedChats && myProfile.pinnedChats[a[0]];
-            const bPinned = myProfile.pinnedChats && myProfile.pinnedChats[b[0]];
-            if (aPinned && !bPinned) return -1;
-            if (!aPinned && bPinned) return 1;
-            const aTime = a[1].meta?.lastMessageAt || 0;
-            const bTime = b[1].meta?.lastMessageAt || 0;
-            return bTime - aTime;
-        });
-
-        chatListEl.innerHTML = '';
-        for (const [chatId, chatData] of myChats) {
-            await renderChatItem(chatId, chatData, chatListEl);
-        }
-
-        // Subscribe to changes
+    
+        // Unsubscribe any previous chat list listener
+        if (App._chatListOff) { App._chatListOff(); App._chatListOff = null; }
+    
         const off = DB.onValue('chats', async snap => {
             const all = snap.val() || {};
             const relevant = Object.entries(all).filter(([id, c]) => c.members && c.members[session.uid]);
-            chatListEl.innerHTML = '';
+    
+            if (relevant.length === 0) {
+                chatListEl.innerHTML = '<div class="empty-list"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>No chats yet</span></div>';
+                return;
+            }
+    
             relevant.sort((a, b) => {
                 const aPinned = myProfile.pinnedChats && myProfile.pinnedChats[a[0]];
                 const bPinned = myProfile.pinnedChats && myProfile.pinnedChats[b[0]];
@@ -249,11 +223,14 @@ const App = (function() {
                 if (!aPinned && bPinned) return 1;
                 return (b[1].meta?.lastMessageAt || 0) - (a[1].meta?.lastMessageAt || 0);
             });
+    
+            chatListEl.innerHTML = '';
             for (const [id, data] of relevant) {
                 await renderChatItem(id, data, chatListEl);
             }
         });
-        listeners.push(off);
+    
+        App._chatListOff = off;
     }
 
     async function renderChatItem(chatId, chatData, container) {
@@ -1107,120 +1084,6 @@ const App = (function() {
                 timestamp: Date.now()
             }).catch(() => {});
         }
-    }
-
-    // ===================== GAMES =====================
-    const GAMES = [
-        { id: 'tictactoe', name: 'Tic Tac Toe', icon: '⭕' },
-        { id: 'connect4', name: 'Connect Four', icon: '🔴' },
-        { id: 'hangman', name: 'Hangman', icon: '🎭' },
-        { id: 'checkers', name: 'Checkers', icon: '⚫' },
-        { id: 'coinflip', name: 'Flip a Coin', icon: '🪙' },
-        { id: 'truthordare', name: 'Truth or Dare', icon: '🎲' },
-        { id: 'poker', name: 'Poker', icon: '🃏' },
-        { id: 'crossword', name: 'Word Guess', icon: '🔤' },
-    ];
-
-    function buildGameGrid() {
-        const grid = document.getElementById('gameGrid');
-        grid.innerHTML = '';
-        for (const game of GAMES) {
-            const btn = document.createElement('button');
-            btn.style.cssText = 'padding:14px;background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;cursor:pointer;color:var(--fg);font-family:"JetBrains Mono",monospace;font-size:11px;display:flex;flex-direction:column;align-items:center;gap:6px;transition:all 0.15s;';
-            btn.innerHTML = `<span style="font-size:24px">${game.icon}</span><span>${game.name}</span>`;
-            btn.addEventListener('mouseover', () => { btn.style.borderColor = 'var(--accent)'; btn.style.background = 'var(--accent-dim)'; });
-            btn.addEventListener('mouseout', () => { btn.style.borderColor = 'var(--border)'; btn.style.background = 'var(--bg-surface)'; });
-            btn.addEventListener('click', () => { closeModal('gameModal'); launchGame(game.id); });
-            grid.appendChild(btn);
-        }
-    }
-
-    function openGameModal() {
-        if (!activeChatId) return;
-        openModal('gameModal');
-    }
-
-    async function launchGame(gameId) {
-        if (!activeChatId) return;
-
-        let gameState, msgContent;
-
-        if (gameId === 'coinflip') {
-            const result = Math.random() < 0.5 ? 'Heads' : 'Tails';
-            msgContent = `🪙 Flipped a coin: **${result}!**`;
-            await DB.push('chats/' + activeChatId + '/messages', {
-                sender: session.username, senderUid: session.uid,
-                content: msgContent, timestamp: Date.now()
-            });
-            await DB.update('chats/' + activeChatId + '/meta', { lastMessage: msgContent.substring(0,60), lastMessageAt: Date.now() });
-            return;
-        }
-
-        if (gameId === 'truthordare') {
-            const truths = ['What\'s your biggest fear?','What\'s the most embarrassing thing you\'ve done?','Do you have a secret crush?'];
-            const dares = ['Send a funny selfie','Tell an embarrassing story','Sing a song out loud'];
-            const type = Math.random() < 0.5 ? 'Truth' : 'Dare';
-            const items = type === 'Truth' ? truths : dares;
-            const pick = items[Math.floor(Math.random() * items.length)];
-            msgContent = `🎲 **${type}:** ${pick}`;
-            await DB.push('chats/' + activeChatId + '/messages', {
-                sender: session.username, senderUid: session.uid,
-                content: msgContent, timestamp: Date.now()
-            });
-            await DB.update('chats/' + activeChatId + '/meta', { lastMessage: msgContent.substring(0,60), lastMessageAt: Date.now() });
-            return;
-        }
-
-        if (gameId === 'tictactoe') {
-            gameState = { type: 'tictactoe', board: Array(9).fill(null), turn: session.uid, players: { [session.uid]: 'X' }, status: 'playing', startedBy: session.username };
-        } else if (gameId === 'connect4') {
-            gameState = { type: 'connect4', board: Array(42).fill(null), turn: session.uid, status: 'playing', startedBy: session.username };
-        } else if (gameId === 'hangman') {
-            const words = ['BLOCKCHAIN','ENCRYPTION','MESSENGER','NETWORK','SECURITY','PROTOCOL'];
-            const word = words[Math.floor(Math.random() * words.length)];
-            gameState = { type: 'hangman', word, guessed: [], wrong: 0, status: 'playing', startedBy: session.username };
-        } else if (gameId === 'checkers') {
-            gameState = { type: 'checkers', board: initCheckersBoard(), turn: session.uid, status: 'playing', startedBy: session.username };
-        } else if (gameId === 'poker') {
-            const deck = createDeck();
-            gameState = { type: 'poker', deck, hand: deck.slice(0, 5), community: deck.slice(5, 10), pot: 100, status: 'playing', startedBy: session.username };
-        } else if (gameId === 'crossword') {
-            const words = ['KEEP','BLACK','SECURE','CHAT','FRIEND'];
-            const target = words[Math.floor(Math.random() * words.length)];
-            gameState = { type: 'wordguess', target, guesses: [], status: 'playing', startedBy: session.username, maxGuesses: 6 };
-        }
-
-        await DB.set('chats/' + activeChatId + '/game', JSON.stringify(gameState));
-        await DB.push('chats/' + activeChatId + '/messages', {
-            sender: session.username, senderUid: session.uid,
-            content: '🎮 Started a game of ' + GAMES.find(g => g.id === gameId)?.name,
-            timestamp: Date.now(),
-            gameState: JSON.stringify(gameState)
-        });
-        await DB.update('chats/' + activeChatId + '/meta', { lastMessage: '🎮 Game started', lastMessageAt: Date.now() });
-    }
-
-    function initCheckersBoard() {
-        const board = Array(64).fill(null);
-        for (let i = 0; i < 24; i++) {
-            const row = Math.floor(i / 4);
-            const col = (i % 4) * 2 + (row % 2 === 0 ? 1 : 0);
-            if (row < 3) board[row * 8 + col] = 'p2';
-            if (row > 4) board[row * 8 + col] = 'p1';
-        }
-        return board;
-    }
-
-    function createDeck() {
-        const suits = ['♠','♥','♦','♣'];
-        const values = ['2','3','4','5','6','7','8','9','10','J','Q','K','A'];
-        const deck = [];
-        for (const s of suits) for (const v of values) deck.push(v + s);
-        for (let i = deck.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [deck[i], deck[j]] = [deck[j], deck[i]];
-        }
-        return deck;
     }
 
     // ===================== SETTINGS =====================
